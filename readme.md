@@ -69,7 +69,7 @@ Phase 6 → Print summary
 ## View Output
 
 ```bash
-python3 -m mujoco.viewer ergocub_clean.xml
+python3 -m mujoco.viewer robot_clean.xml
 ```
 
 ## Troubleshooting
