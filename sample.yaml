@@ -1,0 +1,47 @@
+#
+# ╔════════════════════════════════════════════════════════════════════════════╗
+# ║ Sample Configuration for MCJF_warp                                         ║
+# ║                                                                            ║
+# ║ This is a sample YAML configuration file for converting robot models       ║
+# ║ (URDF/SDF) to MuJoCo MJCF format.                                          ║
+# ║                                                                            ║
+# ║ REQUIRED: All 4 fields must be present:                                    ║
+# ║   - model_path  : Path to the robot model file (URDF/SDF)                  ║
+# ║   - output_path : Path to save the converted MJCF file                     ║
+# ║   - mesh_dir    : Directory containing mesh files (.obj, .stl, .dae)       ║
+# ║   - package_map : Maps package:// URIs to filesystem paths                 ║
+# ║                                                                            ║
+# ║ NOTE: Replace placeholders with your actual paths.                        ║
+# ╚════════════════════════════════════════════════════════════════════════════╝
+
+# ── Path to robot model file ────────────────────────────────────────────────
+# Format: absolute path | relative path | environment variable
+# Examples:
+#   /path/to/robot.urdf                    (absolute)
+#   ./robot.urdf                           (relative to this config file)
+#   ${CONDA_PREFIX}/share/robot/model.urdf (environment variable)
+model_path: "./robot.urdf"  # Replace with the path to your robot URDF file
+
+# ── Output MJCF file path ──────────────────────────────────────────────────
+# The tool will create this file. Path can be relative or absolute.
+# Recommended: use relative paths + version control for reproducibility
+output_path: "./robot_clean.xml"  # Replace with the desired output MJCF file path
+
+# ── Directory with mesh files ──────────────────────────────────────────────
+# MuJoCo compiler will search here for mesh files (.obj, .stl, .dae)
+# Must contain all meshes referenced in the URDF
+mesh_dir: "./meshes"  # Replace with the directory containing your mesh files
+
+# ── Package URI Resolution Map ────────────────────────────────────────────
+# Maps ROS package:// URIs in URDF to actual filesystem paths
+#
+# How it works:
+#   URDF contains: package://my_robot/meshes/hand.obj
+#   package_map maps: my_robot → /path/to/my_robot
+#   Result: package://my_robot/ → /path/to/my_robot/
+#
+# Add an entry for each package referenced in the URDF
+package_map:
+  my_robot: "./my_robot"  # Replace with the path to your package directory
+  # Example for another package:
+  # another_pkg: "/path/to/another_pkg"
