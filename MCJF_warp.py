@@ -1,23 +1,21 @@
 """
-MCJF_warp.py - Universal URDF/SDF to MuJoCo MJCF Converter
+MCJF_wrap.py - Universal URDF to MuJoCo MJCF Converter
 
-A simple, robust tool for converting robot models to MuJoCo MJCF format.
-
-Complete pipeline in 6 phases:
-  Phase 1: Config Loading       - Load and validate YAML configuration
-  Phase 2: Model Processing     - Clean and resolve package URIs
-  Phase 3: Scene Building       - Convert model to MJCF via MuJoCo
-  Phase 4: Validation           - Load and validate with MuJoCo
-  Phase 5: Export               - Save canonical MJCF file
-  Phase 6: Summary              - Print conversion results
+Pipeline:
+  Phase 1: Config Loading        - Validate YAML config
+  Phase 2: Model Processing      - Resolve package URIs
+  Phase 2b: Asset Localization   - Copy meshes to ./assets/
+  Phase 3: Scene Building        - Convert URDF → MJCF
+  Phase 4: Validation            - MuJoCo load test
+  Phase 5: Export                - Save MJCF with ./assets
+  Phase 6: Summary               - Print results
 
 Usage:
   python3 MCJF_warp.py --config ergocub.yaml
-  python3 MCJF_warp.py --config my_robot.yaml
 
-Requirements:
-  - PyYAML: pip install pyyaml
-  - MuJoCo: pip install mujoco
+Outputs:
+  robot_clean.xml     ← Final MJCF (meshdir="./assets")
+  assets/             ← Self-contained mesh bundle
 """
 
 import os
@@ -25,8 +23,9 @@ import sys
 import re
 import argparse
 import yaml
+import shutil
 from pathlib import Path
-from typing import Tuple
+from typing import Tuple, Set
 
 try:
     import mujoco
@@ -40,9 +39,9 @@ except ImportError:
 # ══════════════════════════════════════════════════════════════════════════════
 
 class ConfigLoader:
-    """Load and validate YAML configuration file"""
+    """Load and validate YAML configuration"""
 
-    REQUIRED_FIELDS = ['model_path', 'output_path', 'mesh_dir', 'package_map']
+    REQUIRED_FIELDS = ['model_path', 'output_path', 'mesh_dir']
 
     def __init__(self, yaml_path: str):
         self.yaml_path = yaml_path
@@ -50,23 +49,20 @@ class ConfigLoader:
         self.errors = []
 
     def _expand_path(self, path_str: str) -> str:
-        """Expand paths with environment variables and relative paths"""
+        """Expand env vars, ~, and relative paths"""
         expanded = os.path.expandvars(path_str)
         expanded = os.path.expanduser(expanded)
-        
         if os.path.isabs(expanded):
             return expanded
-        
         config_dir = os.path.dirname(os.path.abspath(self.yaml_path))
         return os.path.join(config_dir, expanded)
 
     def load(self) -> bool:
-        """Load, validate, and expand configuration"""
         print(f"\n[PHASE 1] Config Loading")
-        print(f"  config file: {self.yaml_path}")
+        print(f"  config: {self.yaml_path}")
 
         if not os.path.exists(self.yaml_path):
-            self.errors.append(f"Config file not found: {self.yaml_path}")
+            self.errors.append(f"Config not found: {self.yaml_path}")
             return False
         print(f"  ✓ Config file exists")
 
@@ -75,68 +71,61 @@ class ConfigLoader:
                 self.data = yaml.safe_load(f)
             print(f"  ✓ YAML parsed")
         except yaml.YAMLError as e:
-            self.errors.append(f"YAML syntax error: {e}")
+            self.errors.append(f"YAML error: {e}")
             return False
 
         missing = [f for f in self.REQUIRED_FIELDS if f not in self.data]
         if missing:
-            self.errors.append(f"Missing required fields: {', '.join(missing)}")
+            self.errors.append(f"Missing fields: {', '.join(missing)}")
             return False
-        print(f"  ✓ All required fields present")
+        print(f"  ✓ Required fields present")
 
-        print(f"\n[PHASE 1] Expanding Paths")
-        self.data['model_path'] = self._expand_path(self.data['model_path'])
-        self.data['mesh_dir'] = self._expand_path(self.data['mesh_dir'])
+        if 'package_map' not in self.data:
+            self.data['package_map'] = {}
+
+        # Expand all paths
+        self.data['model_path']  = self._expand_path(self.data['model_path'])
+        self.data['mesh_dir']    = self._expand_path(self.data['mesh_dir'])
         self.data['output_path'] = self._expand_path(self.data['output_path'])
-        
-        expanded_packages = {}
-        for pkg_name, pkg_path in self.data['package_map'].items():
-            expanded_packages[pkg_name] = self._expand_path(pkg_path)
-        self.data['package_map'] = expanded_packages
+        self.data['package_map'] = {
+            k: self._expand_path(v) for k, v in self.data['package_map'].items()
+        }
         print(f"  ✓ Paths expanded")
 
-        print(f"\n[PHASE 1] Validating File Paths")
+        # Validate paths
         if not os.path.exists(self.data['model_path']):
-            self.errors.append(f"Model file not found: {self.data['model_path']}")
+            self.errors.append(f"Model not found: {self.data['model_path']}")
         else:
-            model_ext = Path(self.data['model_path']).suffix.lower()
-            print(f"  ✓ Model file exists ({model_ext})")
-        
+            ext = Path(self.data['model_path']).suffix.lower()
+            if ext not in ['.urdf', '.xml']:
+                self.errors.append(f"Unsupported format: {ext}")
+            else:
+                print(f"  ✓ Model file exists ({ext})")
+
         if not os.path.exists(self.data['mesh_dir']):
             self.errors.append(f"Mesh dir not found: {self.data['mesh_dir']}")
         else:
             print(f"  ✓ Mesh dir accessible")
 
         output_dir = os.path.dirname(self.data['output_path'])
-        if output_dir and not os.path.exists(output_dir):
-            try:
-                os.makedirs(output_dir, exist_ok=True)
-                print(f"  ✓ Output dir created")
-            except Exception as e:
-                self.errors.append(f"Cannot create output dir: {e}")
+        if output_dir:
+            os.makedirs(output_dir, exist_ok=True)
 
         if self.errors:
             return False
 
-        self._print_summary()
+        print(f"\n[PHASE 1] Summary")
+        print(f"  Model       : {os.path.basename(self.data['model_path'])}")
+        print(f"  Output      : {os.path.basename(self.data['output_path'])}")
+        print(f"  Mesh dir    : {os.path.basename(self.data['mesh_dir'])}")
+        print(f"  Packages    : {list(self.data['package_map'].keys()) or 'none'}")
         return True
 
-    def _print_summary(self):
-        """Print loaded configuration"""
-        print(f"\n[PHASE 1] Configuration Summary")
-        model_name = os.path.basename(self.data['model_path'])
-        print(f"  Model file  : {model_name}")
-        print(f"  Output MJCF : {os.path.basename(self.data['output_path'])}")
-        print(f"  Mesh dir    : {os.path.basename(self.data['mesh_dir'])}")
-        print(f"  Packages    : {list(self.data['package_map'].keys())}")
-
     def print_errors(self):
-        """Print all validation errors"""
-        for error in self.errors:
-            print(f"[ERROR] {error}", file=sys.stderr)
+        for e in self.errors:
+            print(f"[ERROR] {e}", file=sys.stderr)
 
     def get(self, key: str, default=None):
-        """Get config value"""
         return self.data.get(key, default)
 
 
@@ -145,71 +134,185 @@ class ConfigLoader:
 # ══════════════════════════════════════════════════════════════════════════════
 
 class ModelProcessor:
-    """Process URDF/SDF: strip declaration, resolve package URIs"""
+    """Resolve package:// URIs and save processed URDF"""
 
     def __init__(self, config: ConfigLoader):
         self.config = config
-        self.raw_xml = ""
-        self.processed_xml = ""
 
     def process(self) -> str:
-        """Process model file and return path"""
         print(f"\n[PHASE 2] Model Processing")
-        
-        # Step 1: Read model file
-        print(f"\n  Reading model file...")
+
         model_path = self.config.get('model_path')
-        try:
-            with open(model_path, 'r') as f:
-                self.raw_xml = f.read()
-            print(f"  ✓ Read {len(self.raw_xml):,} bytes")
-        except Exception as e:
-            print(f"  [ERROR] Cannot read model: {e}", file=sys.stderr)
-            raise
-        
-        self.processed_xml = self.raw_xml
+        mesh_dir   = self.config.get('mesh_dir')
 
-        # Step 2: Strip XML declaration
-        print(f"\n  Stripping XML declaration...")
-        self.processed_xml = re.sub(r'<\?xml[^?]*\?>', '', self.processed_xml).strip()
-        print(f"  ✓ Declaration removed")
+        # Read model
+        print(f"\n  Reading model...")
+        with open(model_path, 'r') as f:
+            xml = f.read()
+        print(f"  ✓ Read {len(xml):,} bytes")
 
-        # Step 3: Resolve package:// URIs
-        print(f"\n  Resolving package:// URIs...")
+        # Strip XML declaration
+        xml = re.sub(r'<\?xml[^?]*\?>', '', xml).strip()
+        print(f"  ✓ XML declaration stripped")
+
+        # Resolve package:// URIs
         package_map = self.config.get('package_map', {})
-        resolved_count = 0
-        
-        for pkg_name, pkg_path in package_map.items():
-            old = f"package://{pkg_name}/"
-            new = pkg_path.rstrip("/") + "/"
-            count = self.processed_xml.count(old)
-            if count > 0:
-                self.processed_xml = self.processed_xml.replace(old, new)
-                print(f"    {pkg_name}: {count} URIs resolved")
-                resolved_count += count
+        if package_map:
+            print(f"\n  Resolving package:// URIs...")
+            resolved_count = 0
+            for pkg_name, pkg_path in package_map.items():
+                old = f"package://{pkg_name}/"
+                new = pkg_path.rstrip("/") + "/"
+                count = xml.count(old)
+                if count > 0:
+                    xml = xml.replace(old, new)
+                    print(f"    {pkg_name}: {count} resolved")
+                    resolved_count += count
 
-        unresolved = list(set(re.findall(r'package://([^/]+)/', self.processed_xml)))
-        if unresolved:
-            print(f"  [WARN] Unresolved packages: {unresolved}")
+            unresolved = list(set(re.findall(r'package://([^/]+)/', xml)))
+            if unresolved:
+                print(f"  [WARN] Still unresolved: {unresolved}")
+            else:
+                print(f"  ✓ All URIs resolved ({resolved_count} total)")
         else:
-            print(f"  ✓ All URIs resolved ({resolved_count} total)")
+            print(f"  ✓ No package_map - skipping URI resolution")
 
-        # Step 4: Write processed model
-        print(f"\n  Saving processed model...")
-        mesh_dir = self.config.get('mesh_dir')
+        # Save resolved model
         model_stem = Path(model_path).stem
-        model_ext = Path(model_path).suffix.lower()
-        processed_path = os.path.join(mesh_dir, f"{model_stem}_resolved{model_ext}")
-        
-        try:
-            with open(processed_path, 'w') as f:
-                f.write(self.processed_xml)
-            print(f"  ✓ Processed model saved")
-        except Exception as e:
-            print(f"  [ERROR] Cannot write processed model: {e}", file=sys.stderr)
-            raise
+        model_ext  = Path(model_path).suffix.lower()
+        resolved_path = os.path.join(mesh_dir, f"{model_stem}_resolved{model_ext}")
+        with open(resolved_path, 'w') as f:
+            f.write(xml)
+        print(f"  ✓ Processed model saved")
 
-        return processed_path
+        return resolved_path
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# PHASE 2b: ASSET LOCALIZATION
+# ══════════════════════════════════════════════════════════════════════════════
+
+class AssetLocalizer:
+    """Extract and copy all mesh files to self-contained ./assets/ folder"""
+
+    MESH_EXTENSIONS = {'.obj', '.stl', '.dae', '.ply'}
+
+    def __init__(self, config: ConfigLoader, processed_urdf: str):
+        self.config = config
+        self.processed_urdf = processed_urdf
+        self.assets_dir = None
+        self.mesh_map = {}  # old_path → new_path
+
+    def localize(self) -> str:
+        """Extract mesh references and copy to assets folder"""
+        print(f"\n[PHASE 2b] Asset Localization")
+
+        output_path = self.config.get('output_path')
+        output_dir = os.path.dirname(os.path.abspath(output_path))
+        self.assets_dir = os.path.join(output_dir, 'assets')
+
+        # Create assets folder
+        os.makedirs(self.assets_dir, exist_ok=True)
+        print(f"  ✓ Assets folder created: {self.assets_dir}")
+
+        # Step 1: Extract all mesh filenames from URDF
+        print(f"\n  Extracting mesh references...")
+        meshes = self._extract_mesh_paths()
+        print(f"  ✓ Found {len(meshes)} mesh files")
+
+        # Step 2: Copy meshes to assets
+        print(f"\n  Copying meshes to assets...")
+        copied_count = 0
+        for source_path in meshes:
+            if self._copy_mesh(source_path):
+                copied_count += 1
+
+        print(f"  ✓ Copied {copied_count} / {len(meshes)} meshes")
+
+        # Step 3: Update URDF with new mesh paths
+        print(f"\n  Updating URDF with local mesh paths...")
+        urdf_updated = self._update_urdf_paths()
+
+        # Save updated URDF
+        model_stem = Path(self.config.get('model_path')).stem
+        mesh_dir = self.config.get('mesh_dir')
+        localized_urdf = os.path.join(mesh_dir, f"{model_stem}_localized.urdf")
+        with open(localized_urdf, 'w') as f:
+            f.write(urdf_updated)
+        print(f"  ✓ Localized URDF saved")
+
+        return localized_urdf
+
+    def _extract_mesh_paths(self) -> Set[str]:
+        """Extract all mesh file paths from URDF"""
+        with open(self.processed_urdf, 'r') as f:
+            urdf_content = f.read()
+
+        # Find all filename attributes
+        # Matches: filename="/path/to/mesh.obj" or filename="mesh.obj"
+        matches = re.findall(r'filename="([^"]+)"', urdf_content)
+
+        mesh_files = set()
+        for match in matches:
+            # Only include actual mesh files (not other assets)
+            if any(match.lower().endswith(ext) for ext in self.MESH_EXTENSIONS):
+                mesh_files.add(match)
+
+        return mesh_files
+
+    def _copy_mesh(self, source_path: str) -> bool:
+        """Copy a single mesh file to assets folder"""
+        if not os.path.exists(source_path):
+            print(f"    [WARN] Mesh not found: {source_path}")
+            return False
+
+        # Get basename and copy
+        basename = os.path.basename(source_path)
+        dest_path = os.path.join(self.assets_dir, basename)
+
+        # Handle filename conflicts (rare, but possible)
+        if os.path.exists(dest_path) and dest_path != source_path:
+            existing_size = os.path.getsize(dest_path)
+            source_size = os.path.getsize(source_path)
+            if existing_size == source_size:
+                # Same file, skip
+                self.mesh_map[source_path] = dest_path
+                return True
+            else:
+                # Different files with same name - add suffix
+                stem, ext = os.path.splitext(basename)
+                counter = 1
+                while True:
+                    dest_path = os.path.join(self.assets_dir, f"{stem}_{counter}{ext}")
+                    if not os.path.exists(dest_path):
+                        break
+                    counter += 1
+
+        try:
+            shutil.copy2(source_path, dest_path)
+            self.mesh_map[source_path] = dest_path
+            print(f"    {basename}")
+            return True
+        except Exception as e:
+            print(f"    [ERROR] Cannot copy {basename}: {e}")
+            return False
+
+    def _update_urdf_paths(self) -> str:
+        """Replace absolute mesh paths with relative ./assets/ paths"""
+        with open(self.processed_urdf, 'r') as f:
+            urdf_content = f.read()
+
+        # Replace all mesh paths with relative ./assets/ paths
+        for old_path, new_path in self.mesh_map.items():
+            basename = os.path.basename(new_path)
+            relative_path = f"./assets/{basename}"
+            urdf_content = urdf_content.replace(old_path, relative_path)
+
+        return urdf_content
+
+    def get_assets_dir(self) -> str:
+        """Return absolute path to assets folder"""
+        return self.assets_dir
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -219,9 +322,10 @@ class ModelProcessor:
 class SceneBuilder:
     """Convert URDF → MJCF and add scene elements"""
 
-    def __init__(self, config: ConfigLoader, processed_model_path: str):
+    def __init__(self, config: ConfigLoader, processed_model_path: str, assets_dir: str):
         self.config = config
         self.processed_model_path = processed_model_path
+        self.assets_dir = assets_dir
 
     def build(self) -> Tuple[str, str]:
         print(f"\n[PHASE 3] Scene Building")
@@ -229,7 +333,7 @@ class SceneBuilder:
         mesh_dir   = self.config.get('mesh_dir')
         model_stem = Path(self.config.get('model_path')).stem
 
-        # Load with MuJoCo
+        # Load with MuJoCo (use absolute assets_dir for internal validation)
         print(f"\n  Loading with MuJoCo...")
         try:
             model = mujoco.MjModel.from_xml_path(self.processed_model_path)
@@ -245,13 +349,12 @@ class SceneBuilder:
             xml = f.read()
         print(f"  ✓ MJCF generated")
 
-        # ── INTERNAL VALIDATION USE ABSOLUTE PATH ──
-        # During Phase 3 and 4, we use absolute meshdir so MuJoCo doesn't get lost
-        abs_mesh_dir = os.path.abspath(mesh_dir)
-        xml = re.sub(r'meshdir="[^"]*"', f'meshdir="{abs_mesh_dir}"', xml)
-        
+        # Set meshdir to absolute assets path for internal validation
+        abs_assets = os.path.abspath(self.assets_dir)
+        xml = re.sub(r'meshdir="[^"]*"', f'meshdir="{abs_assets}"', xml)
+
         if '<compiler' in xml and 'meshdir=' not in xml:
-            xml = xml.replace('<compiler', f'<compiler meshdir="{abs_mesh_dir}"')
+            xml = xml.replace('<compiler', f'<compiler meshdir="{abs_assets}"')
 
         # Remove floating geoms from worldbody
         xml = re.sub(r'(<worldbody>)\s*<geom[^>]*mesh="[^"]*"[^>]*/>', r'\1', xml)
@@ -265,11 +368,11 @@ class SceneBuilder:
         xml = re.sub(r'(<worldbody>)', f'\\1\n{lights}\n{ground}', xml)
         print(f"  ✓ Ground + lights added")
 
-        # Save scene XML for Phase 4 (Validation)
+        # Save scene XML
         scene_path = os.path.join(mesh_dir, f"{model_stem}_scene.xml")
         with open(scene_path, 'w') as f:
             f.write(xml)
-        print(f"  ✓ Scene XML saved (Internal)")
+        print(f"  ✓ Scene XML saved (internal)")
 
         return xml, scene_path
 
@@ -279,7 +382,7 @@ class SceneBuilder:
 # ══════════════════════════════════════════════════════════════════════════════
 
 class MuJoCoValidator:
-    """Load and validate model with MuJoCo"""
+    """Load and validate final scene with MuJoCo"""
 
     def __init__(self, scene_path: str):
         self.scene_path = scene_path
@@ -287,35 +390,26 @@ class MuJoCoValidator:
         self.stats = {}
 
     def validate(self) -> bool:
-        """Load scene and validate"""
-        print(f"\n[PHASE 4] Validation (MuJoCo Load Test)")
-        
+        print(f"\n[PHASE 4] Validation")
         try:
             self.model = mujoco.MjModel.from_xml_path(self.scene_path)
-            print(f"  ✓ Model loaded and validated")
-            
             self.stats = {
                 'nbody': self.model.nbody,
-                'njnt': self.model.njnt,
+                'njnt' : self.model.njnt,
                 'ngeom': self.model.ngeom,
                 'nmesh': self.model.nmesh,
-                'nu': self.model.nu,
+                'nu'   : self.model.nu,
             }
-            
-            self._print_stats()
+            print(f"  ✓ Validated")
+            print(f"  Bodies    : {self.stats['nbody']}")
+            print(f"  Joints    : {self.stats['njnt']}")
+            print(f"  Geoms     : {self.stats['ngeom']}")
+            print(f"  Meshes    : {self.stats['nmesh']}")
+            print(f"  Actuators : {self.stats['nu']}")
             return True
         except Exception as e:
-            print(f"  [ERROR] MuJoCo validation failed: {e}", file=sys.stderr)
+            print(f"  [ERROR] Validation failed: {e}", file=sys.stderr)
             return False
-
-    def _print_stats(self):
-        """Print robot statistics"""
-        print(f"\n[PHASE 4] Robot Statistics")
-        print(f"  Bodies    : {self.stats['nbody']}")
-        print(f"  Joints    : {self.stats['njnt']}")
-        print(f"  Geoms     : {self.stats['ngeom']}")
-        print(f"  Meshes    : {self.stats['nmesh']}")
-        print(f"  Actuators : {self.stats['nu']}")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -323,41 +417,35 @@ class MuJoCoValidator:
 # ══════════════════════════════════════════════════════════════════════════════
 
 class MJCFExporter:
-    """Export final MJCF with clean relative paths"""
+    """Export final MJCF with relative ./assets/ path"""
 
     def __init__(self, config: ConfigLoader, model):
         self.config = config
         self.model = model
 
     def export(self) -> bool:
-        print(f"\n[PHASE 5] Export (MJCF)")
-        
+        print(f"\n[PHASE 5] Export")
+
         output_path = self.config.get('output_path')
-        mesh_dir = self.config.get('mesh_dir')
-        
+
         try:
-            # Save the model to memory first
+            # Save model to temp
             temp_path = output_path + ".tmp"
             mujoco.mj_saveLastXML(temp_path, self.model)
-            
+
             with open(temp_path, 'r') as f:
                 xml = f.read()
             os.remove(temp_path)
 
-            # ── FINAL EXPORT USE RELATIVE PATH ──
-            output_dir = os.path.dirname(os.path.abspath(output_path))
-            try:
-                rel_mesh_dir = os.path.relpath(os.path.abspath(mesh_dir), output_dir)
-            except ValueError:
-                rel_mesh_dir = mesh_dir
+            # Replace meshdir with relative path to ./assets
+            xml = re.sub(r'meshdir="[^"]*"', 'meshdir="./assets"', xml)
 
-            xml = re.sub(r'meshdir="[^"]*"', f'meshdir="{rel_mesh_dir}"', xml)
-            
+            # Write final MJCF
             with open(output_path, 'w') as f:
                 f.write(xml)
 
             file_size = os.path.getsize(output_path)
-            print(f"  ✓ MJCF exported with relative meshdir: {rel_mesh_dir}")
+            print(f"  ✓ MJCF exported with relative meshdir: ./assets")
             print(f"    → {output_path}")
             return True
         except Exception as e:
@@ -370,19 +458,14 @@ class MJCFExporter:
 # ══════════════════════════════════════════════════════════════════════════════
 
 def print_summary(config: ConfigLoader, validator: MuJoCoValidator):
-    """Print conversion summary"""
     print(f"\n[PHASE 6] Summary")
-    print(f"\n  Input:")
-    print(f"    Model: {config.get('model_path')}")
-    print(f"\n  Output:")
-    print(f"    MJCF: {config.get('output_path')}")
-    print(f"\n  Robot Model:")
-    print(f"    Bodies    : {validator.stats['nbody']}")
-    print(f"    Joints    : {validator.stats['njnt']}")
-    print(f"    Geoms     : {validator.stats['ngeom']}")
-    print(f"    Meshes    : {validator.stats['nmesh']}")
-    print(f"    Actuators : {validator.stats['nu']}")
-    print(f"\n  Status    : ✓ SUCCESS")
+    print(f"  Input   : {config.get('model_path')}")
+    print(f"  Output  : {config.get('output_path')}")
+    print(f"  Assets  : ./assets/ (self-contained)")
+    print(f"  Bodies  : {validator.stats['nbody']}")
+    print(f"  Joints  : {validator.stats['njnt']}")
+    print(f"  Meshes  : {validator.stats['nmesh']}")
+    print(f"  Status  : ✓ SUCCESS")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -390,58 +473,57 @@ def print_summary(config: ConfigLoader, validator: MuJoCoValidator):
 # ══════════════════════════════════════════════════════════════════════════════
 
 def main():
-    """Main pipeline: execute all 6 phases"""
-
     parser = argparse.ArgumentParser(
-        description="MCJF_wrap - Convert robot models (URDF/SDF) to MuJoCo MJCF",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""
-Examples:
-  python3 MCJF_warp.py --config ergocub.yaml
-  python3 MCJF_warp.py --config my_robot.yaml
-
-Supports: URDF, SDF, MJCF input files
-See README.md for configuration instructions.
-        """
+        description="MCJF_wrap - Convert robot URDF to MuJoCo MJCF",
+        epilog="Example: python3 MCJF_warp.py --config ergocub.yaml"
     )
-    parser.add_argument('--config', required=True, help='Path to robot YAML config')
+    parser.add_argument('--config', required=True, help='Path to YAML config')
     args = parser.parse_args()
 
     print("\n" + "=" * 70)
-    print("  MCJF_wrap.py - URDF/SDF to MuJoCo MJCF Converter")
+    print("  MCJF_wrap.py - URDF to MuJoCo MJCF Converter")
     print("=" * 70)
 
-    # ── Phase 1: Config Loading ────────────────────────────────────────────
+    # Phase 1
     config = ConfigLoader(args.config)
     if not config.load():
         config.print_errors()
         sys.exit(1)
 
-    # ── Phase 2: Model Processing ──────────────────────────────────────────
+    # Phase 2
     try:
         processor = ModelProcessor(config)
         processed_model = processor.process()
-    except Exception as e:
+    except Exception:
         sys.exit(1)
 
-    # ── Phase 3: Scene Building ────────────────────────────────────────────
+    # Phase 2b: Asset Localization
     try:
-        builder = SceneBuilder(config, processed_model)
-        scene_xml, scene_path = builder.build()
+        localizer = AssetLocalizer(config, processed_model)
+        localized_urdf = localizer.localize()
+        assets_dir = localizer.get_assets_dir()
     except Exception as e:
+        print(f"\n[ERROR] Asset localization failed: {e}", file=sys.stderr)
         sys.exit(1)
 
-    # ── Phase 4: Validation ────────────────────────────────────────────────
+    # Phase 3
+    try:
+        builder = SceneBuilder(config, localized_urdf, assets_dir)
+        _, scene_path = builder.build()
+    except Exception:
+        sys.exit(1)
+
+    # Phase 4
     validator = MuJoCoValidator(scene_path)
     if not validator.validate():
         sys.exit(1)
 
-    # ── Phase 5: Export ────────────────────────────────────────────────────
+    # Phase 5
     exporter = MJCFExporter(config, validator.model)
     if not exporter.export():
         sys.exit(1)
 
-    # ── Phase 6: Summary ───────────────────────────────────────────────────
+    # Phase 6
     print_summary(config, validator)
 
     print("\n" + "=" * 70)
