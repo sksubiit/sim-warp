@@ -1,4 +1,4 @@
-# MCJF_wrap — URDF to MuJoCo MJCF Converter
+# MCJF_warp — URDF to MuJoCo MJCF Converter
 
 Converts robot URDF files to MuJoCo MJCF format. Adds ground plane and lighting.
 
