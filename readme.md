@@ -2,6 +2,10 @@
 
 Converts robot URDF files to MuJoCo MJCF format. Adds ground plane and lighting.
 
+
+<img width="1470" height="1070" alt="image" src="https://github.com/user-attachments/assets/6c9c44d4-91a6-4cdf-853d-18e925481788" />
+
+
 ## Requirements
 
 ### Install MuJoCo (Linux — minimal steps)
