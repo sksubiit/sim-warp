@@ -35,9 +35,11 @@ conda --version
 ### 1. Create Conda Environment with Models
 
 ```bash
-conda create -n ergocubenv -c conda-forge ergocub-models
+conda create -n ergocubenv -c conda-forge python=3.11 ergocub-models
 conda activate ergocubenv
 ```
+
+pin the python for stability
 
 This installs **only the URDF models and meshes** (lightweight). You must also install dependencies:
 
@@ -51,7 +53,7 @@ conda install -c conda-forge mujoco
 
 Or install all in one step:
 ```bash
-conda install -c conda-forge lxml numpy scipy pyyaml idyntree mujoco
+conda create -n ergocubenv -c conda-forge python=3.11 ergocub-models idyntree mujoco lxml numpy scipy pyyaml
 ```
 
 ### 3. Verify Installation
