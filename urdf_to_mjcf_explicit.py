@@ -30,7 +30,7 @@ except ImportError as e:
     sys.exit(1)
 
 
-SUPPORTED_MUJOCO_MESH_SUFFIXES = {".stl", ".obj", ".msh"}
+SUPPORTED_MUJOCO_MESH_SUFFIXES = {".stl", ".obj"}
 
 
 @dataclass
@@ -43,12 +43,22 @@ class InertialSpec:
 @dataclass
 class GeometrySpec:
     kind: str
-    source_file: str
+    shape: str
+    source_file: str | None
     pos: list[float]
     rpy: list[float]
     scale: list[float]
+    size: list[float] | None = None
     backend_file: str | None = None
     backend_status: str = "pending"
+
+
+@dataclass
+class JointSemanticSpec:
+    lower_limit: float | None = None
+    upper_limit: float | None = None
+    damping: float | None = None
+    frictionloss: float | None = None
 
 
 @dataclass
@@ -61,6 +71,10 @@ class JointSpec:
     mj_type: str | None
     axis: list[float] | None
     source_dofs: int
+    lower_limit: float | None = None
+    upper_limit: float | None = None
+    damping: float | None = None
+    frictionloss: float | None = None
 
     @property
     def is_fixed(self) -> bool:
@@ -72,6 +86,24 @@ class LinkNode:
     name: str
     inertia: InertialSpec
     visuals: list[GeometrySpec] = field(default_factory=list)
+    collisions: list[GeometrySpec] = field(default_factory=list)
+
+
+@dataclass
+class RawFixedFrameSpec:
+    name: str
+    parent_link: str
+    child_link: str
+    pos: list[float]
+    rpy: list[float]
+
+
+@dataclass
+class FixedFrameSpec:
+    name: str
+    parent_link: str
+    pos: list[float]
+    quat: list[float]
 
 
 @dataclass
@@ -91,22 +123,33 @@ class RobotModel:
     floating_base: bool = True
     links: dict[str, LinkNode] = field(default_factory=dict)
     joints: list[JointSpec] = field(default_factory=list)
+    joint_by_name: dict[str, JointSpec] = field(default_factory=dict)
     children_by_link: dict[str, list[JointSpec]] = field(default_factory=lambda: defaultdict(list))
     source_only_visual_links: set[str] = field(default_factory=set)
+    source_only_collision_links: set[str] = field(default_factory=set)
+    fixed_frames_by_link: dict[str, list[FixedFrameSpec]] = field(default_factory=lambda: defaultdict(list))
 
     def add_link(self, link: LinkNode) -> None:
         self.links[link.name] = link
 
     def add_joint(self, joint: JointSpec) -> None:
         self.joints.append(joint)
+        self.joint_by_name[joint.name] = joint
         self.children_by_link[joint.parent_link].append(joint)
 
 
 @dataclass
 class SemanticMergeReport:
     articulated_links_with_visuals: int
+    articulated_links_with_collisions: int
     source_only_visual_links: int
+    source_only_collision_links: int
     total_visual_geometries: int
+    total_collision_geometries: int
+    fixed_frames_added: int
+    joints_with_limits: int
+    joints_with_damping: int
+    joints_with_friction: int
 
 
 def rpy_to_quat(r, p, y):
@@ -125,6 +168,34 @@ def mat33_to_quat(H):
     quat = np.zeros(4)
     mujoco.mju_mat2Quat(quat, mat)
     return list(quat)
+
+
+def mat_to_quat(mat) -> list[float]:
+    flat = np.asarray(mat, dtype=float).reshape(9)
+    quat = np.zeros(4)
+    mujoco.mju_mat2Quat(quat, flat)
+    return list(quat)
+
+
+def rpy_to_mat(r, p, y) -> np.ndarray:
+    cr, sr = np.cos(r), np.sin(r)
+    cp, sp = np.cos(p), np.sin(p)
+    cy, sy = np.cos(y), np.sin(y)
+    return np.array(
+        [
+            [cy * cp, cy * sp * sr - sy * cr, cy * sp * cr + sy * sr],
+            [sy * cp, sy * sp * sr + cy * cr, sy * sp * cr - cy * sr],
+            [-sp, cp * sr, cp * cr],
+        ],
+        dtype=float,
+    )
+
+
+def transform_from_pose(pos: list[float], rpy: list[float]) -> np.ndarray:
+    tf = np.eye(4)
+    tf[:3, :3] = rpy_to_mat(*rpy)
+    tf[:3, 3] = np.asarray(pos, dtype=float)
+    return tf
 
 
 def derive_model_name(urdf_path: str) -> str:
@@ -236,55 +307,222 @@ def load_articulated_core(urdf_path: str) -> RobotModel:
     return robot
 
 
-def parse_visual_supplement(urdf_path: str) -> dict[str, list[GeometrySpec]]:
-    """Pass 2: parse source visuals from the localized URDF XML."""
+def parse_joint_semantics(joint_elem) -> JointSemanticSpec:
+    spec = JointSemanticSpec()
+
+    limit = joint_elem.find("limit")
+    if limit is not None:
+        lower = limit.get("lower")
+        upper = limit.get("upper")
+        if lower is not None and upper is not None:
+            spec.lower_limit = float(lower)
+            spec.upper_limit = float(upper)
+
+    dynamics = joint_elem.find("dynamics")
+    if dynamics is not None:
+        damping = dynamics.get("damping")
+        friction = dynamics.get("friction")
+        if damping is not None:
+            spec.damping = float(damping)
+        if friction is not None:
+            spec.frictionloss = float(friction)
+
+    return spec
+
+
+def parse_geometry_spec(geom_elem, kind: str, pos: list[float], rpy: list[float]) -> GeometrySpec | None:
+    mesh = geom_elem.find("mesh")
+    if mesh is not None:
+        scale = [1.0, 1.0, 1.0]
+        if mesh.get("scale"):
+            scale = [float(x) for x in mesh.get("scale").split()]
+        return GeometrySpec(
+            kind=kind,
+            shape="mesh",
+            source_file=mesh.get("filename"),
+            pos=pos,
+            rpy=rpy,
+            scale=scale,
+        )
+
+    box = geom_elem.find("box")
+    if box is not None and box.get("size"):
+        size = [float(x) for x in box.get("size").split()]
+        return GeometrySpec(
+            kind=kind,
+            shape="box",
+            source_file=None,
+            pos=pos,
+            rpy=rpy,
+            scale=[1.0, 1.0, 1.0],
+            size=size,
+        )
+
+    sphere = geom_elem.find("sphere")
+    if sphere is not None and sphere.get("radius"):
+        radius = float(sphere.get("radius"))
+        return GeometrySpec(
+            kind=kind,
+            shape="sphere",
+            source_file=None,
+            pos=pos,
+            rpy=rpy,
+            scale=[1.0, 1.0, 1.0],
+            size=[radius],
+        )
+
+    cylinder = geom_elem.find("cylinder")
+    if cylinder is not None and cylinder.get("radius") and cylinder.get("length"):
+        radius = float(cylinder.get("radius"))
+        half_length = float(cylinder.get("length")) * 0.5
+        return GeometrySpec(
+            kind=kind,
+            shape="cylinder",
+            source_file=None,
+            pos=pos,
+            rpy=rpy,
+            scale=[1.0, 1.0, 1.0],
+            size=[radius, half_length],
+        )
+
+    capsule = geom_elem.find("capsule")
+    if capsule is not None and capsule.get("radius") and capsule.get("length"):
+        radius = float(capsule.get("radius"))
+        half_length = float(capsule.get("length")) * 0.5
+        return GeometrySpec(
+            kind=kind,
+            shape="capsule",
+            source_file=None,
+            pos=pos,
+            rpy=rpy,
+            scale=[1.0, 1.0, 1.0],
+            size=[radius, half_length],
+        )
+
+    return None
+
+
+def parse_semantic_supplement(
+    urdf_path: str,
+) -> tuple[dict[str, list[GeometrySpec]], dict[str, list[GeometrySpec]], dict[str, JointSemanticSpec], dict[str, RawFixedFrameSpec]]:
+    """Pass 2: parse source supplement from the localized URDF XML."""
     tree = ET.parse(urdf_path)
     root = tree.getroot()
     visuals: dict[str, list[GeometrySpec]] = {}
+    collisions: dict[str, list[GeometrySpec]] = {}
+    joint_semantics: dict[str, JointSemanticSpec] = {}
+    raw_fixed_frames: dict[str, RawFixedFrameSpec] = {}
 
     for link in root.findall("link"):
         link_name = link.get("name")
-        geometries: list[GeometrySpec] = []
-        for vis in link.findall("visual"):
-            origin = vis.find("origin")
-            geom = vis.find("geometry/mesh")
-            if geom is None:
-                continue
+        visual_geometries: list[GeometrySpec] = []
+        collision_geometries: list[GeometrySpec] = []
 
-            xyz = [0.0, 0.0, 0.0]
-            rpy = [0.0, 0.0, 0.0]
-            scale = [1.0, 1.0, 1.0]
+        for tag_name, container in (("visual", visual_geometries), ("collision", collision_geometries)):
+            for entry in link.findall(tag_name):
+                origin = entry.find("origin")
+                geom_elem = entry.find("geometry")
+                if geom_elem is None:
+                    continue
 
-            if geom.get("scale"):
-                scale = [float(x) for x in geom.get("scale").split()]
-            if origin is not None:
-                if origin.get("xyz"):
-                    xyz = [float(x) for x in origin.get("xyz").split()]
-                if origin.get("rpy"):
-                    rpy = [float(x) for x in origin.get("rpy").split()]
+                xyz = [0.0, 0.0, 0.0]
+                rpy = [0.0, 0.0, 0.0]
+                if origin is not None:
+                    if origin.get("xyz"):
+                        xyz = [float(x) for x in origin.get("xyz").split()]
+                    if origin.get("rpy"):
+                        rpy = [float(x) for x in origin.get("rpy").split()]
 
-            geometries.append(
-                GeometrySpec(
-                    kind="visual",
-                    source_file=geom.get("filename"),
-                    pos=xyz,
-                    rpy=rpy,
-                    scale=scale,
-                )
+                spec = parse_geometry_spec(geom_elem, tag_name, xyz, rpy)
+                if spec is not None:
+                    container.append(spec)
+
+        visuals[link_name] = visual_geometries
+        collisions[link_name] = collision_geometries
+
+    for joint in root.findall("joint"):
+        joint_name = joint.get("name")
+        joint_semantics[joint_name] = parse_joint_semantics(joint)
+        if joint.get("type") != "fixed":
+            continue
+
+        parent = joint.find("parent")
+        child = joint.find("child")
+        if parent is None or child is None:
+            continue
+
+        xyz = [0.0, 0.0, 0.0]
+        rpy = [0.0, 0.0, 0.0]
+        origin = joint.find("origin")
+        if origin is not None:
+            if origin.get("xyz"):
+                xyz = [float(x) for x in origin.get("xyz").split()]
+            if origin.get("rpy"):
+                rpy = [float(x) for x in origin.get("rpy").split()]
+
+        raw_fixed_frames[child.get("link")] = RawFixedFrameSpec(
+            name=child.get("link"),
+            parent_link=parent.get("link"),
+            child_link=child.get("link"),
+            pos=xyz,
+            rpy=rpy,
+        )
+
+    return visuals, collisions, joint_semantics, raw_fixed_frames
+
+
+def resolve_fixed_frames(raw_fixed_frames: dict[str, RawFixedFrameSpec], robot: RobotModel) -> int:
+    added = 0
+
+    for child_link, frame in raw_fixed_frames.items():
+        if child_link in robot.links:
+            continue
+
+        chain: list[RawFixedFrameSpec] = []
+        current = child_link
+        seen: set[str] = set()
+        anchor = None
+
+        while current in raw_fixed_frames and current not in seen:
+            seen.add(current)
+            current_frame = raw_fixed_frames[current]
+            chain.append(current_frame)
+            parent = current_frame.parent_link
+            if parent in robot.links:
+                anchor = parent
+                break
+            current = parent
+
+        if anchor is None:
+            continue
+
+        transform = np.eye(4)
+        for current_frame in reversed(chain):
+            transform = transform @ transform_from_pose(current_frame.pos, current_frame.rpy)
+
+        robot.fixed_frames_by_link[anchor].append(
+            FixedFrameSpec(
+                name=frame.name,
+                parent_link=anchor,
+                pos=transform[:3, 3].tolist(),
+                quat=mat_to_quat(transform[:3, :3]),
             )
+        )
+        added += 1
 
-        visuals[link_name] = geometries
-
-    return visuals
+    return added
 
 
 def merge_semantic_supplement(robot: RobotModel, urdf_path: str) -> SemanticMergeReport:
     """Pass 3: merge source semantic supplements into one in-memory robot model."""
-    visuals_by_link = parse_visual_supplement(urdf_path)
+    visuals_by_link, collisions_by_link, joint_semantics, raw_fixed_frames = parse_semantic_supplement(urdf_path)
 
     articulated_links_with_visuals = 0
+    articulated_links_with_collisions = 0
     total_visual_geometries = 0
+    total_collision_geometries = 0
     source_only_links = 0
+    source_only_collision_links = 0
 
     for link_name, visuals in visuals_by_link.items():
         if not visuals:
@@ -297,10 +535,49 @@ def merge_semantic_supplement(robot: RobotModel, urdf_path: str) -> SemanticMerg
             robot.source_only_visual_links.add(link_name)
             source_only_links += 1
 
+    for link_name, collisions in collisions_by_link.items():
+        if not collisions:
+            continue
+        total_collision_geometries += len(collisions)
+        if link_name in robot.links:
+            robot.links[link_name].collisions.extend(collisions)
+            articulated_links_with_collisions += 1
+        else:
+            robot.source_only_collision_links.add(link_name)
+            source_only_collision_links += 1
+
+    joints_with_limits = 0
+    joints_with_damping = 0
+    joints_with_friction = 0
+
+    for joint_name, semantics in joint_semantics.items():
+        joint = robot.joint_by_name.get(joint_name)
+        if joint is None:
+            continue
+        joint.lower_limit = semantics.lower_limit
+        joint.upper_limit = semantics.upper_limit
+        joint.damping = semantics.damping
+        joint.frictionloss = semantics.frictionloss
+        if semantics.lower_limit is not None and semantics.upper_limit is not None:
+            joints_with_limits += 1
+        if semantics.damping is not None:
+            joints_with_damping += 1
+        if semantics.frictionloss is not None:
+            joints_with_friction += 1
+
+    fixed_frames_added = resolve_fixed_frames(raw_fixed_frames, robot)
+
     return SemanticMergeReport(
         articulated_links_with_visuals=articulated_links_with_visuals,
+        articulated_links_with_collisions=articulated_links_with_collisions,
         source_only_visual_links=source_only_links,
+        source_only_collision_links=source_only_collision_links,
         total_visual_geometries=total_visual_geometries,
+        total_collision_geometries=total_collision_geometries,
+        fixed_frames_added=fixed_frames_added,
+        joints_with_limits=joints_with_limits,
+        joints_with_damping=joints_with_damping,
+        joints_with_friction=joints_with_friction,
     )
 
 
@@ -311,21 +588,23 @@ def normalize_mesh_file(filename: str) -> str:
     return mesh_file
 
 
+
 def resolve_backend_assets(robot: RobotModel, urdf_path: str) -> AssetResolutionReport:
     """Pass 4a: resolve source visuals into MuJoCo-compatible backend assets."""
     urdf_dir = Path(urdf_path).resolve().parent
     report = AssetResolutionReport()
 
     for link in robot.links.values():
-        for geom in link.visuals:
-            if geom.kind != "visual":
+        for geom in link.visuals + link.collisions:
+            if geom.shape != "mesh":
                 continue
 
             report.total_visuals += 1
             source_file = normalize_mesh_file(geom.source_file)
             source_path = Path(source_file)
+            source_suffix = source_path.suffix.lower()
 
-            if source_path.suffix.lower() in SUPPORTED_MUJOCO_MESH_SUFFIXES:
+            if source_suffix in SUPPORTED_MUJOCO_MESH_SUFFIXES:
                 geom.backend_file = source_file
                 geom.backend_status = "exact"
                 report.exact_matches += 1
@@ -357,6 +636,7 @@ def emit_mjcf(robot: RobotModel, urdf_path: str, output_mjcf_path: str) -> tuple
     spec = mujoco.MjSpec()
     spec.modelname = Path(output_mjcf_path).stem
     spec.compiler.autolimits = True
+    spec.compiler.degree = 0
     spec.compiler.meshdir = str(Path(urdf_path).resolve().parent)
 
     mesh_assets: dict[tuple[str, tuple[float, float, float]], str] = {}
@@ -376,6 +656,50 @@ def emit_mjcf(robot: RobotModel, urdf_path: str, output_mjcf_path: str) -> tuple
         mesh.scale = geom.scale
         mesh_assets[key] = mesh_name
         return mesh_name
+
+    def add_geom_to_body(body, geom: GeometrySpec) -> None:
+        mj_geom = body.add_geom()
+        mj_geom.pos = geom.pos
+        mj_geom.quat = rpy_to_quat(*geom.rpy)
+
+        if geom.shape == "mesh":
+            mj_geom.type = mujoco.mjtGeom.mjGEOM_MESH
+            mj_geom.meshname = get_or_create_mesh_name(geom)
+        elif geom.shape == "box":
+            mj_geom.type = mujoco.mjtGeom.mjGEOM_BOX
+            mj_geom.size = [s * 0.5 for s in geom.size]
+        elif geom.shape == "sphere":
+            mj_geom.type = mujoco.mjtGeom.mjGEOM_SPHERE
+            mj_geom.size = [geom.size[0], 0.0, 0.0]
+        elif geom.shape == "cylinder":
+            mj_geom.type = mujoco.mjtGeom.mjGEOM_CYLINDER
+            mj_geom.size = [geom.size[0], geom.size[1], 0.0]
+        elif geom.shape == "capsule":
+            mj_geom.type = mujoco.mjtGeom.mjGEOM_CAPSULE
+            mj_geom.size = [geom.size[0], geom.size[1], 0.0]
+        else:
+            return
+
+        if geom.kind == "visual":
+            mj_geom.contype = 0
+            mj_geom.conaffinity = 0
+
+    def apply_joint_semantics(mj_joint, joint_spec: JointSpec) -> None:
+        if joint_spec.lower_limit is not None and joint_spec.upper_limit is not None:
+            lower = joint_spec.lower_limit
+            upper = joint_spec.upper_limit
+            if lower == upper:
+                epsilon = 1e-9
+                lower -= epsilon
+                upper += epsilon
+            elif lower > upper:
+                lower, upper = upper, lower
+            mj_joint.limited = True
+            mj_joint.range = [lower, upper]
+        if joint_spec.damping is not None:
+            mj_joint.damping = joint_spec.damping
+        if joint_spec.frictionloss is not None:
+            mj_joint.frictionloss = joint_spec.frictionloss
 
     def synthesize_body(parent_mjbody, link_name: str, incoming_joint: JointSpec | None = None):
         nonlocal bodies_added, joints_added
@@ -398,12 +722,14 @@ def emit_mjcf(robot: RobotModel, urdf_path: str, output_mjcf_path: str) -> tuple
                 joint.name = incoming_joint.name
                 joint.type = mujoco.mjtJoint.mjJNT_HINGE
                 joint.axis = incoming_joint.axis
+                apply_joint_semantics(joint, incoming_joint)
                 joints_added += 1
             elif incoming_joint.mj_type == "slide":
                 joint = body.add_joint()
                 joint.name = incoming_joint.name
                 joint.type = mujoco.mjtJoint.mjJNT_SLIDE
                 joint.axis = incoming_joint.axis
+                apply_joint_semantics(joint, incoming_joint)
                 joints_added += 1
 
         body.explicitinertial = True
@@ -413,14 +739,20 @@ def emit_mjcf(robot: RobotModel, urdf_path: str, output_mjcf_path: str) -> tuple
         bodies_added += 1
 
         for geom in link.visuals:
-            if geom.backend_status == "skipped" or geom.backend_file is None:
+            if geom.shape == "mesh" and (geom.backend_status == "skipped" or geom.backend_file is None):
                 continue
+            add_geom_to_body(body, geom)
 
-            mj_geom = body.add_geom()
-            mj_geom.type = mujoco.mjtGeom.mjGEOM_MESH
-            mj_geom.meshname = get_or_create_mesh_name(geom)
-            mj_geom.pos = geom.pos
-            mj_geom.quat = rpy_to_quat(*geom.rpy)
+        for geom in link.collisions:
+            if geom.shape == "mesh" and (geom.backend_status == "skipped" or geom.backend_file is None):
+                continue
+            add_geom_to_body(body, geom)
+
+        for fixed_frame in robot.fixed_frames_by_link.get(link_name, []):
+            site = body.add_site()
+            site.name = fixed_frame.name
+            site.pos = fixed_frame.pos
+            site.quat = fixed_frame.quat
 
         for child_joint in robot.children_by_link.get(link_name, []):
             synthesize_body(body, child_joint.child_link, incoming_joint=child_joint)
@@ -435,11 +767,20 @@ def emit_mjcf(robot: RobotModel, urdf_path: str, output_mjcf_path: str) -> tuple
 
 def report_compiler_state(robot: RobotModel, merge_report: SemanticMergeReport, asset_report: AssetResolutionReport) -> None:
     articulated_visual_links = sum(1 for link in robot.links.values() if link.visuals)
+    articulated_collision_links = sum(1 for link in robot.links.values() if link.collisions)
     print("\n[2] Parsing semantic supplement from localized URDF...")
     print(f"  ✓ Attached visual semantics to {articulated_visual_links} articulated links")
+    print(f"  ✓ Attached collision semantics to {articulated_collision_links} articulated links")
     print(f"  ✓ Parsed {merge_report.total_visual_geometries} source visual geometries")
+    print(f"  ✓ Parsed {merge_report.total_collision_geometries} source collision geometries")
+    print(f"  ✓ Added {merge_report.fixed_frames_added} fixed frames as canonical sites")
+    print(f"  ✓ Joints with limits merged: {merge_report.joints_with_limits}")
+    print(f"  ✓ Joints with damping merged: {merge_report.joints_with_damping}")
+    print(f"  ✓ Joints with friction merged: {merge_report.joints_with_friction}")
     if merge_report.source_only_visual_links:
         print(f"  ! Found {merge_report.source_only_visual_links} visual links outside the articulated core")
+    if merge_report.source_only_collision_links:
+        print(f"  ! Found {merge_report.source_only_collision_links} collision links outside the articulated core")
 
     print("\n[3] Resolving backend assets for MuJoCo...")
     print(f"  ✓ Exact supported assets: {asset_report.exact_matches}")
