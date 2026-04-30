@@ -7,9 +7,10 @@ This script uses iDynTree as the only robot-model source. It emits:
 - articulated body tree
 - movable joints represented by iDynTree
 - inertial properties carried by iDynTree
+- joint limits carried by iDynTree
 
 It does not supplement the model with URDF-side visuals, collisions, fixed
-frames, limits, dynamics, actuators, or sensors.
+frames, dynamics, actuators, or sensors.
 """
 
 import argparse
@@ -92,6 +93,15 @@ def get_inertia_data(link):
     }
 
 
+def get_joint_limits(joint) -> list[float] | None:
+    if not joint.hasPosLimits():
+        return None
+
+    lower = float(joint.getMinPosLimit(0))
+    upper = float(joint.getMaxPosLimit(0))
+    return [lower, upper]
+
+
 def get_joint_export_data(model, joint_idx: int):
     joint = model.getJoint(joint_idx)
     parent_idx = joint.getFirstAttachedLink()
@@ -104,6 +114,7 @@ def get_joint_export_data(model, joint_idx: int):
     dofs = joint.getNrOfDOFs()
     mj_type = None
     axis = None
+    limits = None
 
     if dofs == 1:
         rev_joint = joint.asRevoluteJoint()
@@ -111,12 +122,14 @@ def get_joint_export_data(model, joint_idx: int):
             motion = rev_joint.getMotionSubspaceVector(0, 0)
             mj_type = mujoco.mjtJoint.mjJNT_HINGE
             axis = [motion.getVal(3), motion.getVal(4), motion.getVal(5)]
+            limits = get_joint_limits(rev_joint)
         else:
             prism_joint = joint.asPrismaticJoint()
             if prism_joint:
                 motion = prism_joint.getMotionSubspaceVector(0, 0)
                 mj_type = mujoco.mjtJoint.mjJNT_SLIDE
                 axis = [motion.getVal(0), motion.getVal(1), motion.getVal(2)]
+                limits = get_joint_limits(prism_joint)
 
     return {
         "name": model.getJointName(joint_idx),
@@ -125,6 +138,7 @@ def get_joint_export_data(model, joint_idx: int):
         "quat": quat,
         "mj_type": mj_type,
         "axis": axis,
+        "limits": limits,
         "dofs": dofs,
     }
 
@@ -159,6 +173,11 @@ def emit_mjcf(model, root_idx: int, children_by_parent, output_mjcf_path: str) -
                 joint.name = incoming_joint["name"]
                 joint.type = incoming_joint["mj_type"]
                 joint.axis = incoming_joint["axis"]
+
+                if incoming_joint["limits"] is not None:
+                    joint.limited = True
+                    joint.range = incoming_joint["limits"]
+
                 joints_added += 1
             elif incoming_joint["dofs"] > 0:
                 unsupported_joints += 1
