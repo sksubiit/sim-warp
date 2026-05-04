@@ -8,9 +8,10 @@ This script uses iDynTree as the only robot-model source. It emits:
 - movable joints represented by iDynTree
 - inertial properties carried by iDynTree
 - joint limits carried by iDynTree
+- joint damping and static friction carried by iDynTree
 
 It does not supplement the model with URDF-side visuals, collisions, fixed
-frames, dynamics, actuators, or sensors.
+frames, actuators, or sensors.
 """
 
 import argparse
@@ -102,6 +103,17 @@ def get_joint_limits(joint) -> list[float] | None:
     return [lower, upper]
 
 
+def get_joint_scalar(joint, getter_name: str) -> float | None:
+    getter = getattr(joint, getter_name, None)
+    if getter is None:
+        return None
+
+    try:
+        return float(getter(0))
+    except TypeError:
+        return float(getter())
+
+
 def get_joint_export_data(model, joint_idx: int):
     joint = model.getJoint(joint_idx)
     parent_idx = joint.getFirstAttachedLink()
@@ -115,6 +127,8 @@ def get_joint_export_data(model, joint_idx: int):
     mj_type = None
     axis = None
     limits = None
+    damping = None
+    frictionloss = None
 
     if dofs == 1:
         rev_joint = joint.asRevoluteJoint()
@@ -123,6 +137,8 @@ def get_joint_export_data(model, joint_idx: int):
             mj_type = mujoco.mjtJoint.mjJNT_HINGE
             axis = [motion.getVal(3), motion.getVal(4), motion.getVal(5)]
             limits = get_joint_limits(rev_joint)
+            damping = get_joint_scalar(rev_joint, "getDamping")
+            frictionloss = get_joint_scalar(rev_joint, "getStaticFriction")
         else:
             prism_joint = joint.asPrismaticJoint()
             if prism_joint:
@@ -130,6 +146,8 @@ def get_joint_export_data(model, joint_idx: int):
                 mj_type = mujoco.mjtJoint.mjJNT_SLIDE
                 axis = [motion.getVal(0), motion.getVal(1), motion.getVal(2)]
                 limits = get_joint_limits(prism_joint)
+                damping = get_joint_scalar(prism_joint, "getDamping")
+                frictionloss = get_joint_scalar(prism_joint, "getStaticFriction")
 
     return {
         "name": model.getJointName(joint_idx),
@@ -139,6 +157,8 @@ def get_joint_export_data(model, joint_idx: int):
         "mj_type": mj_type,
         "axis": axis,
         "limits": limits,
+        "damping": damping,
+        "frictionloss": frictionloss,
         "dofs": dofs,
     }
 
@@ -177,6 +197,12 @@ def emit_mjcf(model, root_idx: int, children_by_parent, output_mjcf_path: str) -
                 if incoming_joint["limits"] is not None:
                     joint.limited = True
                     joint.range = incoming_joint["limits"]
+
+                if incoming_joint["damping"] is not None:
+                    joint.damping = incoming_joint["damping"]
+
+                if incoming_joint["frictionloss"] is not None:
+                    joint.frictionloss = incoming_joint["frictionloss"]
 
                 joints_added += 1
             elif incoming_joint["dofs"] > 0:
