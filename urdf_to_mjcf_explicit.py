@@ -9,9 +9,10 @@ This script uses iDynTree as the only robot-model source. It emits:
 - inertial properties carried by iDynTree
 - joint limits carried by iDynTree
 - joint damping and static friction carried by iDynTree
+- additional frames as MuJoCo sites
 
-It does not supplement the model with URDF-side visuals, collisions, fixed
-frames, actuators, or sensors.
+It does not supplement the model with URDF-side visuals, collisions,
+actuators, or sensors.
 """
 
 import argparse
@@ -36,6 +37,13 @@ def rotation_to_quat(rotation) -> list[float]:
     quat = iDynTree.Vector4()
     rotation.getQuaternion(quat)
     return [quat.getVal(i) for i in range(4)]
+
+
+def transform_to_pose(transform) -> tuple[list[float], list[float]]:
+    H = transform.asHomogeneousTransform()
+    pos = [H.getVal(0, 3), H.getVal(1, 3), H.getVal(2, 3)]
+    quat = rotation_to_quat(transform.getRotation())
+    return pos, quat
 
 
 def derive_model_name(urdf_path: str) -> str:
@@ -119,10 +127,8 @@ def get_joint_export_data(model, joint_idx: int):
     parent_idx = joint.getFirstAttachedLink()
     child_idx = joint.getSecondAttachedLink()
     transform = joint.getRestTransform(parent_idx, child_idx)
-    H = transform.asHomogeneousTransform()
 
-    pos = [H.getVal(0, 3), H.getVal(1, 3), H.getVal(2, 3)]
-    quat = rotation_to_quat(transform.getRotation())
+    pos, quat = transform_to_pose(transform)
     dofs = joint.getNrOfDOFs()
     mj_type = None
     axis = None
@@ -163,17 +169,47 @@ def get_joint_export_data(model, joint_idx: int):
     }
 
 
-def emit_mjcf(model, root_idx: int, children_by_parent, output_mjcf_path: str) -> tuple[int, int, int]:
+def collect_frame_sites(model):
+    sites_by_link: dict[int, list[dict]] = defaultdict(list)
+
+    for frame_idx in range(model.getNrOfFrames()):
+        link_idx = model.getFrameLink(frame_idx)
+        if link_idx < 0:
+            continue
+
+        frame_name = model.getFrameName(frame_idx)
+
+        # Skip the canonical frame that coincides with the link name itself.
+        if frame_name == model.getLinkName(link_idx):
+            continue
+
+        transform = model.getFrameTransform(frame_idx)
+        pos, quat = transform_to_pose(transform)
+        sites_by_link[link_idx].append(
+            {
+                "name": frame_name,
+                "pos": pos,
+                "quat": quat,
+            }
+        )
+
+    return sites_by_link
+
+
+def emit_mjcf(model, root_idx: int, children_by_parent, output_mjcf_path: str):
     spec = mujoco.MjSpec()
     spec.modelname = Path(output_mjcf_path).stem
     spec.compiler.degree = 0
 
+    frame_sites = collect_frame_sites(model)
+
     bodies_added = 0
     joints_added = 0
     unsupported_joints = 0
+    sites_added = 0
 
     def synthesize_link(parent_mjbody, link_idx: int, incoming_joint: dict | None = None):
-        nonlocal bodies_added, joints_added, unsupported_joints
+        nonlocal bodies_added, joints_added, unsupported_joints, sites_added
 
         link_name = model.getLinkName(link_idx)
         link = model.getLink(link_idx)
@@ -215,6 +251,13 @@ def emit_mjcf(model, root_idx: int, children_by_parent, output_mjcf_path: str) -
         body.fullinertia = inertia["fullinertia"]
         bodies_added += 1
 
+        for site_spec in frame_sites.get(link_idx, []):
+            site = body.add_site()
+            site.name = site_spec["name"]
+            site.pos = site_spec["pos"]
+            site.quat = site_spec["quat"]
+            sites_added += 1
+
         for joint_idx in children_by_parent.get(link_idx, []):
             child_joint = get_joint_export_data(model, joint_idx)
             synthesize_link(body, child_joint["child_idx"], child_joint)
@@ -224,7 +267,12 @@ def emit_mjcf(model, root_idx: int, children_by_parent, output_mjcf_path: str) -
     with open(output_mjcf_path, "w") as f:
         f.write(spec.to_xml())
 
-    return bodies_added, joints_added, unsupported_joints
+    return {
+        "bodies_added": bodies_added,
+        "joints_added": joints_added,
+        "unsupported_joints": unsupported_joints,
+        "sites_added": sites_added,
+    }
 
 
 def run_explicit_synthesis(urdf_path: str, output_mjcf_path: str | None):
@@ -238,15 +286,16 @@ def run_explicit_synthesis(urdf_path: str, output_mjcf_path: str | None):
     loader, model, root_idx, children_by_parent = load_idyntree_model(urdf_path)
 
     print("\n[2] Emitting articulated MuJoCo MjSpec...")
-    bodies_added, joints_added, unsupported_joints = emit_mjcf(
+    stats = emit_mjcf(
         model,
         root_idx,
         children_by_parent,
         output_mjcf_path,
     )
-    print(f"  ✓ Synthesized {bodies_added} bodies")
-    print(f"  ✓ Synthesized {joints_added} explicit 1-DOF joints")
-    print(f"  ! Unsupported non-1-DOF joints skipped as MuJoCo joints: {unsupported_joints}")
+    print(f"  ✓ Synthesized {stats['bodies_added']} bodies")
+    print(f"  ✓ Synthesized {stats['joints_added']} explicit 1-DOF joints")
+    print(f"  ✓ Added {stats['sites_added']} frame sites")
+    print(f"  ! Unsupported non-1-DOF joints skipped as MuJoCo joints: {stats['unsupported_joints']}")
 
     print("\n[3] Saved explicit MJCF")
     print(f"  ✓ Output XML: {output_mjcf_path}")
