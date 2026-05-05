@@ -10,9 +10,10 @@ This script uses iDynTree as the only robot-model source. It emits:
 - joint limits carried by iDynTree
 - joint damping and static friction carried by iDynTree
 - additional frames as MuJoCo sites
+- visual geometry from iDynTree
+- collision geometry from iDynTree
 
-It does not supplement the model with URDF-side visuals, collisions,
-actuators, or sensors.
+It does not supplement the model with URDF-side parsing, actuators, or sensors.
 """
 
 import argparse
@@ -44,6 +45,17 @@ def transform_to_pose(transform) -> tuple[list[float], list[float]]:
     pos = [H.getVal(0, 3), H.getVal(1, 3), H.getVal(2, 3)]
     quat = rotation_to_quat(transform.getRotation())
     return pos, quat
+
+
+def vector3_to_list(vec) -> list[float]:
+    return [float(vec.getVal(0)), float(vec.getVal(1)), float(vec.getVal(2))]
+
+
+def container_size(container) -> int:
+    try:
+        return int(container.size())
+    except AttributeError:
+        return len(container)
 
 
 def derive_model_name(urdf_path: str) -> str:
@@ -105,17 +117,13 @@ def get_inertia_data(link):
 def get_joint_limits(joint) -> list[float] | None:
     if not joint.hasPosLimits():
         return None
-
-    lower = float(joint.getMinPosLimit(0))
-    upper = float(joint.getMaxPosLimit(0))
-    return [lower, upper]
+    return [float(joint.getMinPosLimit(0)), float(joint.getMaxPosLimit(0))]
 
 
 def get_joint_scalar(joint, getter_name: str) -> float | None:
     getter = getattr(joint, getter_name, None)
     if getter is None:
         return None
-
     try:
         return float(getter(0))
     except TypeError:
@@ -178,8 +186,6 @@ def collect_frame_sites(model):
             continue
 
         frame_name = model.getFrameName(frame_idx)
-
-        # Skip the canonical frame that coincides with the link name itself.
         if frame_name == model.getLinkName(link_idx):
             continue
 
@@ -196,25 +202,134 @@ def collect_frame_sites(model):
     return sites_by_link
 
 
+def get_shape_spec(shape):
+    pos, quat = transform_to_pose(shape.getLink_H_geometry())
+
+    if shape.isExternalMesh():
+        mesh = shape.asExternalMesh()
+        mesh_file = str(mesh.getFileLocationOnLocalFileSystem())
+        if not mesh_file:
+            return None
+        return {
+            "geom_type": "mesh",
+            "mesh_file": mesh_file,
+            "mesh_scale": vector3_to_list(mesh.getScale()),
+            "pos": pos,
+            "quat": quat,
+        }
+
+    if shape.isSphere():
+        sphere = shape.asSphere()
+        return {
+            "geom_type": "sphere",
+            "size": [float(sphere.getRadius())],
+            "pos": pos,
+            "quat": quat,
+        }
+
+    if shape.isBox():
+        box = shape.asBox()
+        return {
+            "geom_type": "box",
+            "size": [0.5 * float(box.getX()), 0.5 * float(box.getY()), 0.5 * float(box.getZ())],
+            "pos": pos,
+            "quat": quat,
+        }
+
+    if shape.isCylinder():
+        cylinder = shape.asCylinder()
+        return {
+            "geom_type": "cylinder",
+            "size": [float(cylinder.getRadius()), 0.5 * float(cylinder.getLength())],
+            "pos": pos,
+            "quat": quat,
+        }
+
+    return None
+
+
+def collect_link_shapes(model, which: str):
+    shapes_by_link: dict[int, list[dict]] = defaultdict(list)
+
+    if which == "visual":
+        link_shape_sets = model.visualSolidShapes().getLinkSolidShapes()
+    elif which == "collision":
+        link_shape_sets = model.collisionSolidShapes().getLinkSolidShapes()
+    else:
+        raise ValueError(f"Unsupported shape set: {which}")
+
+    for link_idx in range(model.getNrOfLinks()):
+        link_shapes = link_shape_sets[link_idx]
+        for shape_idx in range(container_size(link_shapes)):
+            shape_spec = get_shape_spec(link_shapes[shape_idx])
+            if shape_spec is not None:
+                shapes_by_link[link_idx].append(shape_spec)
+
+    return shapes_by_link
+
+
+def add_shape_geom(body, spec, mesh_assets, shape_spec, collision: bool):
+    geom = body.add_geom()
+
+    if shape_spec["geom_type"] == "mesh":
+        mesh_file = shape_spec["mesh_file"]
+        mesh_name = mesh_assets.get(mesh_file)
+
+        if mesh_name is None:
+            mesh_name = f"mesh_{len(mesh_assets)}"
+            mesh = spec.add_mesh()
+            mesh.name = mesh_name
+            mesh.file = mesh_file
+            mesh.scale = shape_spec["mesh_scale"]
+            mesh_assets[mesh_file] = mesh_name
+
+        geom.type = mujoco.mjtGeom.mjGEOM_MESH
+        geom.meshname = mesh_name
+    else:
+        geom.type = getattr(mujoco.mjtGeom, f"mjGEOM_{shape_spec['geom_type'].upper()}")
+        geom.size = shape_spec["size"]
+
+    geom.pos = shape_spec["pos"]
+    geom.quat = shape_spec["quat"]
+
+    if collision:
+        geom.contype = 1
+        geom.conaffinity = 1
+        geom.group = 3
+        geom.rgba = [0.8, 0.2, 0.2, 0.35]
+    else:
+        geom.contype = 0
+        geom.conaffinity = 0
+        geom.group = 1
+
+    return geom
+
+
 def emit_mjcf(model, root_idx: int, children_by_parent, output_mjcf_path: str):
     spec = mujoco.MjSpec()
     spec.modelname = Path(output_mjcf_path).stem
     spec.compiler.degree = 0
+    spec.compiler.meshdir = str(Path(output_mjcf_path).resolve().parent)
 
     frame_sites = collect_frame_sites(model)
+    visual_shapes = collect_link_shapes(model, "visual")
+    collision_shapes = collect_link_shapes(model, "collision")
 
+    mesh_assets: dict[str, str] = {}
     bodies_added = 0
     joints_added = 0
     unsupported_joints = 0
     sites_added = 0
+    visual_geoms_added = 0
+    collision_geoms_added = 0
 
     def synthesize_link(parent_mjbody, link_idx: int, incoming_joint: dict | None = None):
-        nonlocal bodies_added, joints_added, unsupported_joints, sites_added
+        nonlocal bodies_added, joints_added, unsupported_joints
+        nonlocal sites_added, visual_geoms_added, collision_geoms_added
 
-        link_name = model.getLinkName(link_idx)
         link = model.getLink(link_idx)
         body = parent_mjbody.add_body()
-        body.name = link_name
+        body.name = model.getLinkName(link_idx)
 
         if incoming_joint is None:
             body.pos = [0.0, 0.0, 0.0]
@@ -258,6 +373,14 @@ def emit_mjcf(model, root_idx: int, children_by_parent, output_mjcf_path: str):
             site.quat = site_spec["quat"]
             sites_added += 1
 
+        for shape_spec in visual_shapes.get(link_idx, []):
+            add_shape_geom(body, spec, mesh_assets, shape_spec, collision=False)
+            visual_geoms_added += 1
+
+        for shape_spec in collision_shapes.get(link_idx, []):
+            add_shape_geom(body, spec, mesh_assets, shape_spec, collision=True)
+            collision_geoms_added += 1
+
         for joint_idx in children_by_parent.get(link_idx, []):
             child_joint = get_joint_export_data(model, joint_idx)
             synthesize_link(body, child_joint["child_idx"], child_joint)
@@ -272,6 +395,9 @@ def emit_mjcf(model, root_idx: int, children_by_parent, output_mjcf_path: str):
         "joints_added": joints_added,
         "unsupported_joints": unsupported_joints,
         "sites_added": sites_added,
+        "visual_geoms_added": visual_geoms_added,
+        "collision_geoms_added": collision_geoms_added,
+        "mesh_assets_added": len(mesh_assets),
     }
 
 
@@ -286,15 +412,13 @@ def run_explicit_synthesis(urdf_path: str, output_mjcf_path: str | None):
     loader, model, root_idx, children_by_parent = load_idyntree_model(urdf_path)
 
     print("\n[2] Emitting articulated MuJoCo MjSpec...")
-    stats = emit_mjcf(
-        model,
-        root_idx,
-        children_by_parent,
-        output_mjcf_path,
-    )
+    stats = emit_mjcf(model, root_idx, children_by_parent, output_mjcf_path)
     print(f"  ✓ Synthesized {stats['bodies_added']} bodies")
     print(f"  ✓ Synthesized {stats['joints_added']} explicit 1-DOF joints")
     print(f"  ✓ Added {stats['sites_added']} frame sites")
+    print(f"  ✓ Added {stats['visual_geoms_added']} visual geoms")
+    print(f"  ✓ Added {stats['collision_geoms_added']} collision geoms")
+    print(f"  ✓ Added {stats['mesh_assets_added']} mesh assets")
     print(f"  ! Unsupported non-1-DOF joints skipped as MuJoCo joints: {stats['unsupported_joints']}")
 
     print("\n[3] Saved explicit MJCF")
