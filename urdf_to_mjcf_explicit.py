@@ -149,7 +149,7 @@ def get_joint_export_data(model, joint_idx: int):
     if dofs == 1:
         rev_joint = joint.asRevoluteJoint()
         if rev_joint:
-            motion = rev_joint.getMotionSubspaceVector(0, 0)
+            motion = rev_joint.getMotionSubspaceVector(0, child_idx, parent_idx)
             mj_type = mujoco.mjtJoint.mjJNT_HINGE
             axis = [motion.getVal(3), motion.getVal(4), motion.getVal(5)]
             limits = get_joint_limits(rev_joint)
@@ -158,7 +158,7 @@ def get_joint_export_data(model, joint_idx: int):
         else:
             prism_joint = joint.asPrismaticJoint()
             if prism_joint:
-                motion = prism_joint.getMotionSubspaceVector(0, 0)
+                motion = prism_joint.getMotionSubspaceVector(0, child_idx, parent_idx)
                 mj_type = mujoco.mjtJoint.mjJNT_SLIDE
                 axis = [motion.getVal(0), motion.getVal(1), motion.getVal(2)]
                 limits = get_joint_limits(prism_joint)
