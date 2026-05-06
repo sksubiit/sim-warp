@@ -12,8 +12,10 @@ This script uses iDynTree as the only robot-model source. It emits:
 - additional frames as MuJoCo sites
 - visual geometry from iDynTree
 - collision geometry from iDynTree
+- accelerometer sensors from iDynTree
+- six-axis force-torque sensors from iDynTree
 
-It does not supplement the model with URDF-side parsing, actuators, or sensors.
+It does not supplement the model with actuators.
 """
 
 import argparse
@@ -268,6 +270,58 @@ def collect_link_shapes(model, which: str):
     return shapes_by_link
 
 
+def collect_accelerometer_sensors(loader):
+    sensors_by_link: dict[int, list[dict]] = defaultdict(list)
+    sensors = loader.sensors()
+    count = sensors.getNrOfSensors(iDynTree.ACCELEROMETER)
+
+    for sensor_idx in range(count):
+        sensor = sensors.getAccelerometerSensor(sensor_idx)
+        link_idx = sensor.getParentLinkIndex()
+        pos, quat = transform_to_pose(sensor.getLinkSensorTransform())
+
+        sensors_by_link[link_idx].append(
+            {
+                "name": sensor.getName(),
+                "site_name": f"{sensor.getName()}_site",
+                "pos": pos,
+                "quat": quat,
+            }
+        )
+
+    return sensors_by_link
+
+
+def collect_ft_sensors(loader):
+    sensors_by_link: dict[int, list[dict]] = defaultdict(list)
+    sensors = loader.sensors()
+    count = sensors.getNrOfSensors(iDynTree.SIX_AXIS_FORCE_TORQUE)
+
+    for sensor_idx in range(count):
+        sensor = sensors.getSixAxisForceTorqueSensor(sensor_idx)
+        link_idx = sensor.getAppliedWrenchLink()
+
+        transform = iDynTree.Transform()
+        ok = sensor.getLinkSensorTransform(link_idx, transform)
+        if not ok:
+            continue
+
+        pos, quat = transform_to_pose(transform)
+
+        sensors_by_link[link_idx].append(
+            {
+                "name": sensor.getName(),
+                "force_name": f"{sensor.getName()}_force",
+                "torque_name": f"{sensor.getName()}_torque",
+                "site_name": f"{sensor.getName()}_site",
+                "pos": pos,
+                "quat": quat,
+            }
+        )
+
+    return sensors_by_link
+
+
 def add_shape_geom(body, spec, mesh_assets, shape_spec, collision: bool):
     geom = body.add_geom()
 
@@ -305,7 +359,7 @@ def add_shape_geom(body, spec, mesh_assets, shape_spec, collision: bool):
     return geom
 
 
-def emit_mjcf(model, root_idx: int, children_by_parent, output_mjcf_path: str):
+def emit_mjcf(loader, model, root_idx: int, children_by_parent, output_mjcf_path: str):
     spec = mujoco.MjSpec()
     spec.modelname = Path(output_mjcf_path).stem
     spec.compiler.degree = 0
@@ -314,6 +368,8 @@ def emit_mjcf(model, root_idx: int, children_by_parent, output_mjcf_path: str):
     frame_sites = collect_frame_sites(model)
     visual_shapes = collect_link_shapes(model, "visual")
     collision_shapes = collect_link_shapes(model, "collision")
+    accelerometers = collect_accelerometer_sensors(loader)
+    ft_sensors = collect_ft_sensors(loader)
 
     mesh_assets: dict[str, str] = {}
     bodies_added = 0
@@ -322,10 +378,11 @@ def emit_mjcf(model, root_idx: int, children_by_parent, output_mjcf_path: str):
     sites_added = 0
     visual_geoms_added = 0
     collision_geoms_added = 0
+    sensors_added = 0
 
     def synthesize_link(parent_mjbody, link_idx: int, incoming_joint: dict | None = None):
         nonlocal bodies_added, joints_added, unsupported_joints
-        nonlocal sites_added, visual_geoms_added, collision_geoms_added
+        nonlocal sites_added, visual_geoms_added, collision_geoms_added, sensors_added
 
         link = model.getLink(link_idx)
         body = parent_mjbody.add_body()
@@ -373,6 +430,41 @@ def emit_mjcf(model, root_idx: int, children_by_parent, output_mjcf_path: str):
             site.quat = site_spec["quat"]
             sites_added += 1
 
+        for acc_spec in accelerometers.get(link_idx, []):
+            site = body.add_site()
+            site.name = acc_spec["site_name"]
+            site.pos = acc_spec["pos"]
+            site.quat = acc_spec["quat"]
+            sites_added += 1
+
+            sensor = spec.add_sensor()
+            sensor.name = acc_spec["name"]
+            sensor.type = mujoco.mjtSensor.mjSENS_ACCELEROMETER
+            sensor.objtype = mujoco.mjtObj.mjOBJ_SITE
+            sensor.objname = acc_spec["site_name"]
+            sensors_added += 1
+
+        for ft_spec in ft_sensors.get(link_idx, []):
+            site = body.add_site()
+            site.name = ft_spec["site_name"]
+            site.pos = ft_spec["pos"]
+            site.quat = ft_spec["quat"]
+            sites_added += 1
+
+            force_sensor = spec.add_sensor()
+            force_sensor.name = ft_spec["force_name"]
+            force_sensor.type = mujoco.mjtSensor.mjSENS_FORCE
+            force_sensor.objtype = mujoco.mjtObj.mjOBJ_SITE
+            force_sensor.objname = ft_spec["site_name"]
+            sensors_added += 1
+
+            torque_sensor = spec.add_sensor()
+            torque_sensor.name = ft_spec["torque_name"]
+            torque_sensor.type = mujoco.mjtSensor.mjSENS_TORQUE
+            torque_sensor.objtype = mujoco.mjtObj.mjOBJ_SITE
+            torque_sensor.objname = ft_spec["site_name"]
+            sensors_added += 1
+
         for shape_spec in visual_shapes.get(link_idx, []):
             add_shape_geom(body, spec, mesh_assets, shape_spec, collision=False)
             visual_geoms_added += 1
@@ -398,6 +490,7 @@ def emit_mjcf(model, root_idx: int, children_by_parent, output_mjcf_path: str):
         "visual_geoms_added": visual_geoms_added,
         "collision_geoms_added": collision_geoms_added,
         "mesh_assets_added": len(mesh_assets),
+        "sensors_added": sensors_added,
     }
 
 
@@ -412,13 +505,14 @@ def run_explicit_synthesis(urdf_path: str, output_mjcf_path: str | None):
     loader, model, root_idx, children_by_parent = load_idyntree_model(urdf_path)
 
     print("\n[2] Emitting articulated MuJoCo MjSpec...")
-    stats = emit_mjcf(model, root_idx, children_by_parent, output_mjcf_path)
+    stats = emit_mjcf(loader, model, root_idx, children_by_parent, output_mjcf_path)
     print(f"  ✓ Synthesized {stats['bodies_added']} bodies")
     print(f"  ✓ Synthesized {stats['joints_added']} explicit 1-DOF joints")
-    print(f"  ✓ Added {stats['sites_added']} frame sites")
+    print(f"  ✓ Added {stats['sites_added']} frame and sensor sites")
     print(f"  ✓ Added {stats['visual_geoms_added']} visual geoms")
     print(f"  ✓ Added {stats['collision_geoms_added']} collision geoms")
     print(f"  ✓ Added {stats['mesh_assets_added']} mesh assets")
+    print(f"  ✓ Added {stats['sensors_added']} sensors")
     print(f"  ! Unsupported non-1-DOF joints skipped as MuJoCo joints: {stats['unsupported_joints']}")
 
     print("\n[3] Saved explicit MJCF")
