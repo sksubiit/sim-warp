@@ -15,7 +15,7 @@ This script uses iDynTree as the only robot-model source. It emits:
 - accelerometer sensors from iDynTree
 - six-axis force-torque sensors from iDynTree
 
-It does not supplement the model with actuators.
+It does not supplement the model with URDF-side parsing or actuators.
 """
 
 import argparse
@@ -60,6 +60,10 @@ def container_size(container) -> int:
         return len(container)
 
 
+def pose_key(pos: list[float], quat: list[float], digits: int = 9) -> tuple:
+    return tuple(round(v, digits) for v in (pos + quat))
+
+
 def derive_model_name(urdf_path: str) -> str:
     stem = Path(urdf_path).stem
     if stem.endswith("_localized"):
@@ -71,7 +75,7 @@ def derive_output_path(urdf_path: str, output_mjcf_path: str | None = None) -> s
     if output_mjcf_path:
         return output_mjcf_path
     urdf_file = Path(urdf_path)
-    return str(urdf_file.with_name(f"{derive_model_name(urdf_path)}_skeleton.xml"))
+    return str(urdf_file.with_name(f"{derive_model_name(urdf_path)}_synthesis.xml"))
 
 
 def load_idyntree_model(urdf_path: str):
@@ -181,6 +185,7 @@ def get_joint_export_data(model, joint_idx: int):
 
 def collect_frame_sites(model):
     sites_by_link: dict[int, list[dict]] = defaultdict(list)
+    site_lookup: dict[int, dict[tuple, str]] = defaultdict(dict)
 
     for frame_idx in range(model.getNrOfFrames()):
         link_idx = model.getFrameLink(frame_idx)
@@ -193,15 +198,11 @@ def collect_frame_sites(model):
 
         transform = model.getFrameTransform(frame_idx)
         pos, quat = transform_to_pose(transform)
-        sites_by_link[link_idx].append(
-            {
-                "name": frame_name,
-                "pos": pos,
-                "quat": quat,
-            }
-        )
+        spec = {"name": frame_name, "pos": pos, "quat": quat}
+        sites_by_link[link_idx].append(spec)
+        site_lookup[link_idx][pose_key(pos, quat)] = frame_name
 
-    return sites_by_link
+    return sites_by_link, site_lookup
 
 
 def get_shape_spec(shape):
@@ -279,13 +280,13 @@ def collect_accelerometer_sensors(loader):
         sensor = sensors.getAccelerometerSensor(sensor_idx)
         link_idx = sensor.getParentLinkIndex()
         pos, quat = transform_to_pose(sensor.getLinkSensorTransform())
-
         sensors_by_link[link_idx].append(
             {
                 "name": sensor.getName(),
                 "site_name": f"{sensor.getName()}_site",
                 "pos": pos,
                 "quat": quat,
+                "sensor_type": mujoco.mjtSensor.mjSENS_ACCELEROMETER,
             }
         )
 
@@ -307,15 +308,21 @@ def collect_ft_sensors(loader):
             continue
 
         pos, quat = transform_to_pose(transform)
-
         sensors_by_link[link_idx].append(
             {
-                "name": sensor.getName(),
-                "force_name": f"{sensor.getName()}_force",
-                "torque_name": f"{sensor.getName()}_torque",
                 "site_name": f"{sensor.getName()}_site",
                 "pos": pos,
                 "quat": quat,
+                "sensor_defs": [
+                    {
+                        "name": f"{sensor.getName()}_force",
+                        "sensor_type": mujoco.mjtSensor.mjSENS_FORCE,
+                    },
+                    {
+                        "name": f"{sensor.getName()}_torque",
+                        "sensor_type": mujoco.mjtSensor.mjSENS_TORQUE,
+                    },
+                ],
             }
         )
 
@@ -359,13 +366,27 @@ def add_shape_geom(body, spec, mesh_assets, shape_spec, collision: bool):
     return geom
 
 
+def ensure_site(body, link_idx: int, site_spec: dict, site_lookup: dict[int, dict[tuple, str]]):
+    key = pose_key(site_spec["pos"], site_spec["quat"])
+    existing_name = site_lookup[link_idx].get(key)
+    if existing_name is not None:
+        return existing_name, False
+
+    site = body.add_site()
+    site.name = site_spec["site_name"]
+    site.pos = site_spec["pos"]
+    site.quat = site_spec["quat"]
+    site_lookup[link_idx][key] = site_spec["site_name"]
+    return site_spec["site_name"], True
+
+
 def emit_mjcf(loader, model, root_idx: int, children_by_parent, output_mjcf_path: str):
     spec = mujoco.MjSpec()
     spec.modelname = Path(output_mjcf_path).stem
     spec.compiler.degree = 0
     spec.compiler.meshdir = str(Path(output_mjcf_path).resolve().parent)
 
-    frame_sites = collect_frame_sites(model)
+    frame_sites, site_lookup = collect_frame_sites(model)
     visual_shapes = collect_link_shapes(model, "visual")
     collision_shapes = collect_link_shapes(model, "collision")
     accelerometers = collect_accelerometer_sensors(loader)
@@ -431,39 +452,29 @@ def emit_mjcf(loader, model, root_idx: int, children_by_parent, output_mjcf_path
             sites_added += 1
 
         for acc_spec in accelerometers.get(link_idx, []):
-            site = body.add_site()
-            site.name = acc_spec["site_name"]
-            site.pos = acc_spec["pos"]
-            site.quat = acc_spec["quat"]
-            sites_added += 1
+            site_name, created = ensure_site(body, link_idx, acc_spec, site_lookup)
+            if created:
+                sites_added += 1
 
             sensor = spec.add_sensor()
             sensor.name = acc_spec["name"]
-            sensor.type = mujoco.mjtSensor.mjSENS_ACCELEROMETER
+            sensor.type = acc_spec["sensor_type"]
             sensor.objtype = mujoco.mjtObj.mjOBJ_SITE
-            sensor.objname = acc_spec["site_name"]
+            sensor.objname = site_name
             sensors_added += 1
 
         for ft_spec in ft_sensors.get(link_idx, []):
-            site = body.add_site()
-            site.name = ft_spec["site_name"]
-            site.pos = ft_spec["pos"]
-            site.quat = ft_spec["quat"]
-            sites_added += 1
+            site_name, created = ensure_site(body, link_idx, ft_spec, site_lookup)
+            if created:
+                sites_added += 1
 
-            force_sensor = spec.add_sensor()
-            force_sensor.name = ft_spec["force_name"]
-            force_sensor.type = mujoco.mjtSensor.mjSENS_FORCE
-            force_sensor.objtype = mujoco.mjtObj.mjOBJ_SITE
-            force_sensor.objname = ft_spec["site_name"]
-            sensors_added += 1
-
-            torque_sensor = spec.add_sensor()
-            torque_sensor.name = ft_spec["torque_name"]
-            torque_sensor.type = mujoco.mjtSensor.mjSENS_TORQUE
-            torque_sensor.objtype = mujoco.mjtObj.mjOBJ_SITE
-            torque_sensor.objname = ft_spec["site_name"]
-            sensors_added += 1
+            for sensor_def in ft_spec["sensor_defs"]:
+                sensor = spec.add_sensor()
+                sensor.name = sensor_def["name"]
+                sensor.type = sensor_def["sensor_type"]
+                sensor.objtype = mujoco.mjtObj.mjOBJ_SITE
+                sensor.objname = site_name
+                sensors_added += 1
 
         for shape_spec in visual_shapes.get(link_idx, []):
             add_shape_geom(body, spec, mesh_assets, shape_spec, collision=False)
