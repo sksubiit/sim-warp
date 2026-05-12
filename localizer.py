@@ -30,7 +30,8 @@ import shutil
 import sys
 import os
 import argparse
-from pathlib import Path
+from pathlib import Path, PurePosixPath
+from urllib.parse import unquote, urlparse
 from xml.etree import ElementTree as ET
 
 
@@ -112,11 +113,93 @@ def parse_package_uri(uri):
     if len(parts) != 2:
         raise ValueError(f"Malformed package URI: {uri}")
 
-    return parts[0], Path(parts[1])
+    return parts[0], sanitize_relative_path(parts[1], context=uri)
+
+
+def sanitize_relative_path(path_str, context):
+    """Normalize a mesh path and reject absolute or escaping paths."""
+    normalized = PurePosixPath(path_str.replace("\\", "/"))
+    if normalized.is_absolute():
+        raise ValueError(f"Absolute mesh paths are not supported: {context}")
+
+    parts = [part for part in normalized.parts if part not in ("", ".")]
+    if not parts:
+        raise ValueError(f"Empty mesh path is not supported: {context}")
+    if any(part == ".." for part in parts):
+        raise ValueError(f"Mesh path cannot escape its base directory: {context}")
+
+    return Path(*parts)
+
+
+def derive_file_uri_relative_path(src_file):
+    """Map a file:// URI into a stable relative path under the localized mesh tree."""
+    parts = [part for part in src_file.parts if part not in (src_file.anchor, "/")]
+    if not parts:
+        raise ValueError(f"Cannot derive output path for file URI: {src_file}")
+    return Path("external") / Path(*parts)
+
+
+def ensure_within_directory(path, root, context):
+    """Ensure a resolved path remains within the expected root directory."""
+    resolved_path = path.resolve()
+    resolved_root = root.resolve()
+    try:
+        resolved_path.relative_to(resolved_root)
+    except ValueError as exc:
+        raise ValueError(f"Mesh path escapes '{resolved_root}': {context}") from exc
+    return resolved_path
+
+
+def resolve_relative_mesh_reference(mesh_ref, urdf_dir, package_path):
+    """Resolve a plain relative mesh reference and keep it within the package root."""
+    normalized = PurePosixPath(mesh_ref.replace("\\", "/"))
+    if normalized.is_absolute():
+        raise ValueError(f"Absolute mesh paths are not supported: {mesh_ref}")
+
+    parts = [part for part in normalized.parts if part not in ("", ".")]
+    if not parts:
+        raise ValueError(f"Empty mesh path is not supported: {mesh_ref}")
+
+    src_file = ensure_within_directory(urdf_dir / Path(*parts), package_path, mesh_ref)
+    return src_file, src_file.relative_to(package_path.resolve())
+
+
+def resolve_mesh_reference(mesh_ref, urdf_path, package_name, package_path):
+    """Resolve a mesh reference to its source file and localized relative path."""
+    parsed = urlparse(mesh_ref)
+    urdf_dir = Path(urdf_path).parent.resolve()
+
+    if mesh_ref.startswith("package://"):
+        ref_package_name, relative_path = parse_package_uri(mesh_ref)
+        if ref_package_name != package_name:
+            raise FileNotFoundError(
+                f"Referenced mesh belongs to package '{ref_package_name}', expected '{package_name}': {mesh_ref}"
+            )
+        src_file = ensure_within_directory(package_path / relative_path, package_path, mesh_ref)
+        return src_file, relative_path
+
+    if parsed.scheme == "file":
+        if parsed.netloc not in ("", "localhost"):
+            raise ValueError(f"Unsupported file URI host in mesh reference: {mesh_ref}")
+        src_file = Path(unquote(parsed.path)).resolve()
+        relative_path = derive_file_uri_relative_path(src_file)
+        return src_file, relative_path
+
+    if parsed.scheme:
+        raise ValueError(f"Unsupported mesh URI scheme in '{mesh_ref}'")
+
+    return resolve_relative_mesh_reference(mesh_ref, urdf_dir, package_path)
+
+
+def localized_mesh_path(mesh_ref, urdf_path, package_name, package_path, meshes_local_name):
+    """Return the localized mesh path that should be written back into the URDF."""
+    _, relative_path = resolve_mesh_reference(mesh_ref, urdf_path, package_name, package_path)
+    return (Path(".") / meshes_local_name / relative_path).as_posix()
 
 
 def copy_meshes(urdf_path, package_name, package_path, dst_meshes_path):
     """Copy all mesh files referenced by the URDF into the localized mesh tree."""
+    dst_meshes_path = dst_meshes_path.resolve()
     dst_meshes_path.mkdir(parents=True, exist_ok=True)
 
     tree = ET.parse(urdf_path)
@@ -134,21 +217,12 @@ def copy_meshes(urdf_path, package_name, package_path, dst_meshes_path):
 
     copied_files = []
     for mesh_ref in mesh_refs:
-        if mesh_ref.startswith("package://"):
-            ref_package_name, relative_path = parse_package_uri(mesh_ref)
-            if ref_package_name != package_name:
-                raise FileNotFoundError(
-                    f"Referenced mesh belongs to package '{ref_package_name}', expected '{package_name}': {mesh_ref}"
-                )
-            src_file = package_path / relative_path
-        else:
-            relative_path = Path(mesh_ref)
-            src_file = (Path(urdf_path).parent / relative_path).resolve()
+        src_file, relative_path = resolve_mesh_reference(mesh_ref, urdf_path, package_name, package_path)
 
         if not src_file.exists():
             raise FileNotFoundError(f"Referenced mesh not found: {src_file}")
 
-        dst_file = dst_meshes_path / relative_path
+        dst_file = ensure_within_directory(dst_meshes_path / relative_path, dst_meshes_path, mesh_ref)
         dst_file.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(src_file, dst_file)
 
@@ -161,8 +235,8 @@ def copy_meshes(urdf_path, package_name, package_path, dst_meshes_path):
     return copied_files
 
 
-def rewrite_urdf_paths(urdf_path, meshes_local_name="meshes"):
-    """Rewrite package mesh paths to localized relative paths."""
+def rewrite_urdf_paths(urdf_path, package_name, package_path, meshes_local_name="meshes"):
+    """Rewrite mesh paths to localized relative paths."""
     tree = ET.parse(urdf_path)
     root = tree.getroot()
 
@@ -170,9 +244,8 @@ def rewrite_urdf_paths(urdf_path, meshes_local_name="meshes"):
 
     for mesh_elem in root.findall(".//mesh"):
         filename = mesh_elem.get("filename")
-        if filename and filename.startswith("package://"):
-            _, relative_path = parse_package_uri(filename)
-            new_filename = (Path(".") / meshes_local_name / relative_path).as_posix()
+        if filename:
+            new_filename = localized_mesh_path(filename, urdf_path, package_name, package_path, meshes_local_name)
             mesh_elem.set("filename", new_filename)
             meshes_rewritten += 1
             print(f"  ✓ {filename} → {new_filename}")
@@ -204,7 +277,7 @@ def main():
 
     copy_meshes(urdf_path, package_name, package_path, meshes_output_dir)
 
-    urdf_tree = rewrite_urdf_paths(urdf_path, meshes_local_name=meshes_dir_name)
+    urdf_tree = rewrite_urdf_paths(urdf_path, package_name, package_path, meshes_local_name=meshes_dir_name)
     urdf_tree.write(localized_urdf_path, encoding="utf-8", xml_declaration=True)
 
     print("==================================================")

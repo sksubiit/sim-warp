@@ -46,14 +46,13 @@ This installs **only the URDF models and meshes** (lightweight). You must also i
 ### 2. Install Dependencies
 
 ```bash
-conda install -c conda-forge lxml numpy scipy pyyaml
 conda install -c conda-forge idyntree
 conda install -c conda-forge mujoco
 ```
 
 Or install all in one step:
 ```bash
-conda create -n ergocubenv -c conda-forge python=3.11 ergocub-models idyntree mujoco lxml numpy scipy pyyaml
+conda create -n ergocubenv -c conda-forge python=3.11 ergocub-models idyntree mujoco
 ```
 
 ### 3. Verify Installation
@@ -71,8 +70,8 @@ conda run -n ergocubenv python localizer.py --robot robot_name/robot_version
 ```
 
 **Output:** 
-- `outputs/robot_localized.urdf` 
-- `outputs/meshes/` (all mesh files)
+- `outputs/<variant>_localized.urdf`
+- `outputs/meshes_<variant>/` (all mesh files)
 
 Example variant:
 ```bash
@@ -83,11 +82,11 @@ conda run -n ergocubenv python localizer.py --robot ergoCub/ergoCubGazeboSN001
 
 ```bash
 conda run -n ergocubenv python urdf_to_mjcf_explicit.py \
-  --urdf outputs/robot_localized.urdf \
-  --output outputs/robot_synthesis.xml
+  --urdf outputs/<variant>_localized.urdf \
+  --output outputs/<variant>_synthesis.xml
 ```
 
-**Output:** `outputs/robot_synthesis.xml` (native MuJoCo format)
+**Output:** `outputs/<variant>_synthesis.xml` (native MuJoCo format)
 
 
 Example variant:
@@ -100,7 +99,7 @@ conda run -n ergocubenv python urdf_to_mjcf_explicit.py \
 ### Step 3: Visualize
 
 ```bash
-conda run -n ergocubenv python -m mujoco.viewer --mjcf outputs/robot_synthesis.xml
+conda run -n ergocubenv python -m mujoco.viewer --mjcf outputs/<variant>_synthesis.xml
 ```
 
 
@@ -118,14 +117,10 @@ conda run -n ergocubenv python -m mujoco.viewer --mjcf outputs/ergoCubGazeboSN00
 | `ergocub-models` | conda-forge | URDF + mesh files (ROS standard layout) | `localizer.py` |
 | `idyntree` | conda-forge | Extract topology, joints, mass, inertia from URDF | Both scripts |
 | `mujoco` | conda-forge | Create MjSpec, matrix↔quaternion conversion, export MJCF | `urdf_to_mjcf_explicit.py` |
-| `numpy` | conda-forge | Matrix/quaternion math operations | `urdf_to_mjcf_explicit.py` |
-| `lxml` | conda-forge | XML parsing (ElementTree) | Both scripts |
-| `scipy` | conda-forge | Scientific computing utilities | Optional (future use) |
-| `pyyaml` | conda-forge | YAML parsing | Optional (future config files) |
 
 **Install all at once:**
 ```bash
-conda create -n ergocubenv -c conda-forge ergocub-models lxml numpy scipy pyyaml idyntree mujoco
+conda create -n ergocubenv -c conda-forge python=3.11 ergocub-models idyntree mujoco
 ```
 
 ---
@@ -152,5 +147,5 @@ python -m mujoco.viewer --mjcf outputs/ergoCubGazeboSN001_synthesis.xml
 
 **Expected outputs:**
 - `outputs/ergoCubGazeboSN001_localized.urdf` — Localized URDF
-- `outputs/meshes/` — Local mesh directory
+- `outputs/meshes_ergoCubGazeboSN001/` — Local mesh directory
 - `outputs/ergoCubGazeboSN001_synthesis.xml` — MuJoCo-native MJCF

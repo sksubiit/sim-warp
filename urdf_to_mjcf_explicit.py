@@ -450,7 +450,7 @@ def emit_mjcf(loader, model, root_idx, children_by_parent, output_mjcf_path):
             synthesize_link(body, child_joint["child_idx"], child_joint)
 
     synthesize_link(spec.worldbody, root_idx)
-    output_path.write_text(spec.to_xml())
+    output_path.write_text(spec.to_xml(), encoding="utf-8", newline="\n")
     stats["mesh_assets_added"] = len(mesh_assets)
     return stats
 
